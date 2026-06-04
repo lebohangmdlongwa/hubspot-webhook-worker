@@ -1,4 +1,23 @@
+# Cloudflare Worker — Revert Snapshot
+
+This is the full working implementation of `src/index.ts` as of the last known-working state.
+To revert: replace the entire contents of `src/index.ts` with the code block below, then `wrangler deploy`.
+
+The secrets this version needs:
+- `HUBSPOT_CLIENT_ID`
+- `HUBSPOT_CLIENT_SECRET`
+- `WIX_CLIENT_ID` → `e24ccf8c-8cd5-4e03-b1bc-00a93a4b265d`
+- `WIX_CLIENT_SECRET` → `88f3e21d-dc2e-42e3-a309-ec2b1116a4e7`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
+**Known limitation**: The Wix `client_credentials` token this version obtains has
+`"permissions": ""` — it gets a 403 when calling the Wix Contacts API for any site.
+This is why the proxy approach was attempted as a replacement.
+
+```typescript
 import { createClient } from '@supabase/supabase-js';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 
 export interface Env {
 	HUBSPOT_CLIENT_ID: string;
@@ -16,33 +35,34 @@ function getSupabase(env: Env) {
 	return createClient(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
 }
 
-// Per-instance token cache — keyed by instanceId so each installed site gets its own scoped token.
-const wixTokenCache = new Map<string, { token: string; expiresAt: number }>();
+let wixTokenCache: { token: string; expiresAt: number } | null = null;
 
-async function getWixAccessToken(env: Env, instanceId: string): Promise<string> {
-	const cached = wixTokenCache.get(instanceId);
-	if (cached && Date.now() < cached.expiresAt - 60_000) return cached.token;
-
+async function getWixAccessToken(env: Env): Promise<string> {
+	if (wixTokenCache && Date.now() < wixTokenCache.expiresAt - 60_000) {
+		return wixTokenCache.token;
+	}
 	const res = await fetch('https://www.wixapis.com/oauth2/token', {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
 		body: JSON.stringify({
-			grant_type: 'client_credentials',
-			client_id: env.WIX_CLIENT_ID,
-			client_secret: env.WIX_CLIENT_SECRET,
-			instance_id: instanceId,
+			clientId: env.WIX_CLIENT_ID,
+			clientSecret: env.WIX_CLIENT_SECRET,
+			grantType: 'client_credentials',
 		}),
 	});
-	if (!res.ok) throw new Error(`Wix token exchange failed: ${res.status} ${await res.text()}`);
-	const data = (await res.json()) as { access_token?: string; expires_in?: number };
-	const token = data.access_token ?? '';
-	if (!token) throw new Error('Wix token exchange returned no access_token');
-	wixTokenCache.set(instanceId, { token, expiresAt: Date.now() + (data.expires_in ?? 3600) * 1000 });
+	const rawText = await res.text();
+	console.log('[wix-token] status', res.status, 'body', rawText);
+	if (!res.ok) throw new Error(`Wix token exchange failed: ${res.status} ${rawText}`);
+	const data = JSON.parse(rawText) as Record<string, unknown>;
+	console.log('[wix-token] keys', Object.keys(data));
+	const token = (data.access_token ?? data.token ?? '') as string;
+	const expiresIn = (data.expires_in ?? 3600) as number;
+	wixTokenCache = { token, expiresAt: Date.now() + expiresIn * 1000 };
 	return token;
 }
 
-async function wixApiHeaders(env: Env, instanceId: string, siteId: string): Promise<Record<string, string>> {
-	const token = await getWixAccessToken(env, instanceId);
+async function wixApiHeaders(env: Env, siteId: string): Promise<Record<string, string>> {
+	const token = await getWixAccessToken(env);
 	return {
 		Authorization: `Bearer ${token}`,
 		'wix-site-id': siteId,
@@ -50,9 +70,9 @@ async function wixApiHeaders(env: Env, instanceId: string, siteId: string): Prom
 	};
 }
 
-async function wixGetContact(env: Env, instanceId: string, siteId: string, contactId: string) {
+async function wixGetContact(env: Env, siteId: string, contactId: string) {
 	const res = await fetch(`${WIX_CONTACTS_API}/${contactId}`, {
-		headers: await wixApiHeaders(env, instanceId, siteId),
+		headers: await wixApiHeaders(env, siteId),
 	});
 	if (!res.ok) throw new Error(`wixGetContact ${res.status}: ${await res.text()}`);
 	const { contact } = (await res.json()) as {
@@ -61,15 +81,15 @@ async function wixGetContact(env: Env, instanceId: string, siteId: string, conta
 	return contact;
 }
 
-async function wixUpdateContact(env: Env, instanceId: string, siteId: string, contactId: string, revision: number, info: Record<string, unknown>): Promise<void> {
-	const headers = await wixApiHeaders(env, instanceId, siteId);
+async function wixUpdateContact(env: Env, siteId: string, contactId: string, revision: number, info: Record<string, unknown>): Promise<void> {
+	const headers = await wixApiHeaders(env, siteId);
 	const res = await fetch(`${WIX_CONTACTS_API}/${contactId}`, {
 		method: 'PATCH',
 		headers,
 		body: JSON.stringify({ revision, info }),
 	});
 	if (res.status === 409) {
-		const fresh = await wixGetContact(env, instanceId, siteId, contactId);
+		const fresh = await wixGetContact(env, siteId, contactId);
 		const retry = await fetch(`${WIX_CONTACTS_API}/${contactId}`, {
 			method: 'PATCH',
 			headers,
@@ -81,10 +101,10 @@ async function wixUpdateContact(env: Env, instanceId: string, siteId: string, co
 	if (!res.ok) throw new Error(`wixUpdateContact ${res.status}: ${await res.text()}`);
 }
 
-async function wixCreateContact(env: Env, instanceId: string, siteId: string, info: Record<string, unknown>): Promise<string | null> {
+async function wixCreateContact(env: Env, siteId: string, info: Record<string, unknown>): Promise<string | null> {
 	const res = await fetch(WIX_CONTACTS_API, {
 		method: 'POST',
-		headers: await wixApiHeaders(env, instanceId, siteId),
+		headers: await wixApiHeaders(env, siteId),
 		body: JSON.stringify({ info }),
 	});
 	if (res.status === 409) {
@@ -93,8 +113,8 @@ async function wixCreateContact(env: Env, instanceId: string, siteId: string, in
 		};
 		const existingId = body?.details?.applicationError?.data?.duplicateContactId;
 		if (!existingId) throw new Error('409 but no duplicateContactId');
-		const existing = await wixGetContact(env, instanceId, siteId, existingId);
-		await wixUpdateContact(env, instanceId, siteId, existingId, existing.revision, info);
+		const existing = await wixGetContact(env, siteId, existingId);
+		await wixUpdateContact(env, siteId, existingId, existing.revision, info);
 		return existingId;
 	}
 	if (!res.ok) throw new Error(`wixCreateContact ${res.status}: ${await res.text()}`);
@@ -178,14 +198,13 @@ async function getFieldMappings(env: Env, instanceId: string): Promise<FieldMapp
 	return saved.length ? saved : defaults;
 }
 
-// Per-isolate cache: "siteId:baseKey" → resolved Wix extended field key
 const extFieldKeyCache = new Map<string, string>();
 
-async function resolveExtendedFieldKey(env: Env, instanceId: string, siteId: string, baseKey: string): Promise<string> {
+async function resolveExtendedFieldKey(env: Env, siteId: string, baseKey: string): Promise<string> {
 	const cacheKey = `${siteId}:${baseKey}`;
 	if (extFieldKeyCache.has(cacheKey)) return extFieldKeyCache.get(cacheKey)!;
 	try {
-		const res = await fetch(WIX_EXTENDED_FIELDS_API, { headers: await wixApiHeaders(env, instanceId, siteId) });
+		const res = await fetch(WIX_EXTENDED_FIELDS_API, { headers: await wixApiHeaders(env, siteId) });
 		if (!res.ok) return baseKey;
 		const data = (await res.json()) as { fields?: { key: string }[] };
 		for (const field of data.fields ?? []) {
@@ -200,7 +219,7 @@ async function resolveExtendedFieldKey(env: Env, instanceId: string, siteId: str
 	return baseKey;
 }
 
-async function buildWixInfo(env: Env, instanceId: string, siteId: string, hsProperties: Record<string, string>, mappings: FieldMapping[]): Promise<Record<string, unknown>> {
+async function buildWixInfo(env: Env, siteId: string, hsProperties: Record<string, string>, mappings: FieldMapping[]): Promise<Record<string, unknown>> {
 	const applicable = mappings.filter((m) => m.direction === 'hubspot_to_wix' || m.direction === 'bidirectional');
 	const info: Record<string, unknown> = {};
 	const extItems: Record<string, string> = {};
@@ -212,48 +231,30 @@ async function buildWixInfo(env: Env, instanceId: string, siteId: string, hsProp
 
 		if (m.wixField.startsWith('extendedFields.')) {
 			const baseKey = m.wixField.slice('extendedFields.'.length);
-			const actualKey = await resolveExtendedFieldKey(env, instanceId, siteId, baseKey);
+			const actualKey = await resolveExtendedFieldKey(env, siteId, baseKey);
 			extItems[actualKey] = value;
 			continue;
 		}
 
 		switch (m.wixField) {
-			case 'info.name.first':
-				(info.name as any) ??= {};
-				(info.name as any).first = value;
-				break;
-			case 'info.name.last':
-				(info.name as any) ??= {};
-				(info.name as any).last = value;
-				break;
-			case 'info.emails[0].email':
-				info.emails = { items: [{ email: value, tag: 'MAIN' }] };
-				break;
-			case 'info.phones[0].phone':
-				info.phones = { items: [{ phone: value, tag: 'MAIN' }] };
-				break;
-			case 'info.company.name':
-				info.company = value;
-				break;
-			case 'info.jobTitle':
-				info.jobTitle = value;
-				break;
+			case 'info.name.first': (info.name as any) ??= {}; (info.name as any).first = value; break;
+			case 'info.name.last': (info.name as any) ??= {}; (info.name as any).last = value; break;
+			case 'info.emails[0].email': info.emails = { items: [{ email: value, tag: 'MAIN' }] }; break;
+			case 'info.phones[0].phone': info.phones = { items: [{ phone: value, tag: 'MAIN' }] }; break;
+			case 'info.company.name': info.company = value; break;
+			case 'info.jobTitle': info.jobTitle = value; break;
 			case 'info.addresses[0].addressLine':
 				if (!info.addresses) info.addresses = { items: [{ tag: 'HOME', address: {} }] };
-				((info.addresses as any).items[0].address).addressLine = value;
-				break;
+				((info.addresses as any).items[0].address).addressLine = value; break;
 			case 'info.addresses[0].city':
 				if (!info.addresses) info.addresses = { items: [{ tag: 'HOME', address: {} }] };
-				((info.addresses as any).items[0].address).city = value;
-				break;
+				((info.addresses as any).items[0].address).city = value; break;
 			case 'info.addresses[0].country':
 				if (!info.addresses) info.addresses = { items: [{ tag: 'HOME', address: {} }] };
-				((info.addresses as any).items[0].address).country = value;
-				break;
+				((info.addresses as any).items[0].address).country = value; break;
 			case 'info.addresses[0].postalCode':
 				if (!info.addresses) info.addresses = { items: [{ tag: 'HOME', address: {} }] };
-				((info.addresses as any).items[0].address).postalCode = value;
-				break;
+				((info.addresses as any).items[0].address).postalCode = value; break;
 		}
 	}
 
@@ -263,8 +264,6 @@ async function buildWixInfo(env: Env, instanceId: string, siteId: string, hsProp
 
 	return info;
 }
-
-// ── / — HubSpot CRM subscription webhook ─────────────────────────
 
 async function handleWebhook(req: Request, env: Env): Promise<Response> {
 	const rawBody = await req.text();
@@ -284,164 +283,75 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
 	}
 
 	const sb = getSupabase(env);
-
 	console.log('[webhook] events received', events.length, JSON.stringify(events.map(e => ({ eventId: e.eventId, type: e.subscriptionType, objectId: e.objectId, portalId: e.portalId, changeSource: e.changeSource }))));
 
 	for (const event of events) {
-		if (!event.subscriptionType?.startsWith('contact.')) {
-			console.log('[webhook] skip non-contact event', event.subscriptionType);
-			continue;
-		}
+		if (!event.subscriptionType?.startsWith('contact.')) { console.log('[webhook] skip non-contact event', event.subscriptionType); continue; }
 		const hsId = String(event.objectId);
 
 		const { error: insertErr } = await sb.from('processed_events').insert({ event_id: event.eventId, processed_at: new Date().toISOString() });
 		if (insertErr) {
-			if ((insertErr as any).code === '23505') {
-				console.log('[webhook] skip: already processed', event.eventId);
-				continue;
-			} else {
-				console.error('[webhook] processed_events insert error — processing anyway', event.eventId, insertErr.message);
-			}
+			if ((insertErr as any).code === '23505') { console.log('[webhook] skip: already processed', event.eventId); continue; }
+			else { console.error('[webhook] processed_events insert error — processing anyway', event.eventId, insertErr.message); }
 		}
 
 		try {
-			const { data: tokenRows } = await sb
-				.from('hubspot_tokens')
-				.select('instance_id, site_id')
-				.eq('portal_id', event.portalId)
-				.limit(1);
+			const { data: tokenRows } = await sb.from('hubspot_tokens').select('instance_id, site_id').eq('portal_id', event.portalId).limit(1);
 			const tokenRow = tokenRows?.[0] ?? null;
 			console.log('[webhook] token lookup', JSON.stringify({ portalId: event.portalId, found: !!tokenRow }));
-
-			if (!tokenRow) {
-				console.warn('[webhook] no installation for portal', event.portalId);
-				continue;
-			}
+			if (!tokenRow) { console.warn('[webhook] no installation for portal', event.portalId); continue; }
 
 			const instanceId: string = tokenRow.instance_id;
 			const siteId: string = (tokenRow as any).site_id ?? instanceId;
 			const syncId = crypto.randomUUID();
 
-			// HubSpot contact deleted → remove sync records so it disappears from Manage Contacts
-			if (event.subscriptionType === 'contact.deletion') {
-				console.log('[webhook] contact deleted in HubSpot — removing sync records', hsId);
-				await Promise.all([
-					sb.from('contact_id_map').delete().eq('instance_id', instanceId).eq('hubspot_id', hsId).eq('entity_type', 'contact'),
-					sb.from('sync_log').delete().eq('instance_id', instanceId).eq('hubspot_id', hsId),
-				]);
-				continue;
-			}
-
 			const hsToken = await getHubSpotToken(env, instanceId);
 			const mappings = await getFieldMappings(env, instanceId);
-			const customHsProps = mappings
-				.filter((m) => m.direction !== 'wix_to_hubspot')
-				.map((m) => m.hubspotProp);
-
+			const customHsProps = mappings.filter((m) => m.direction !== 'wix_to_hubspot').map((m) => m.hubspotProp);
 			const contact = await hsGetContact(hsToken, hsId, customHsProps);
 			const hsProps = contact.properties;
 
-			console.log('[webhook] processing', JSON.stringify({
-				hsId,
-				siteId,
-				subscriptionType: event.subscriptionType,
-				changeSource: event.changeSource,
-				wix_sync_source: hsProps.wix_sync_source,
-			}));
+			console.log('[webhook] processing', JSON.stringify({ hsId, siteId, subscriptionType: event.subscriptionType, changeSource: event.changeSource, wix_sync_source: hsProps.wix_sync_source }));
 
 			const syncTs = parseInt(hsProps.wix_sync_timestamp ?? '0', 10);
-			if (hsProps.wix_sync_source?.startsWith('wix_sync_') && Date.now() - syncTs < 60_000) {
-				console.log('[webhook] skip: own write within 60s', JSON.stringify({ hsId, syncTs }));
-				continue;
-			}
+			if (hsProps.wix_sync_source?.startsWith('wix_sync_') && Date.now() - syncTs < 60_000) { console.log('[webhook] skip: own write within 60s', JSON.stringify({ hsId, syncTs })); continue; }
 
-			const { data: idMapRows } = await sb
-				.from('contact_id_map')
-				.select('wix_id, last_sync_source, last_synced_at')
-				.eq('instance_id', instanceId)
-				.eq('hubspot_id', hsId)
-				.eq('entity_type', 'contact')
-				.limit(1);
+			const { data: idMapRows } = await sb.from('contact_id_map').select('wix_id, last_sync_source, last_synced_at').eq('instance_id', instanceId).eq('hubspot_id', hsId).eq('entity_type', 'contact').limit(1);
 			const idMap = Array.isArray(idMapRows) ? idMapRows[0] ?? null : null;
 			console.log('[webhook] idMap lookup', JSON.stringify({ found: !!idMap, wixId: idMap?.wix_id }));
 
 			if (idMap) {
 				const lastSyncMs = new Date(idMap.last_synced_at).getTime();
-				if (idMap.last_sync_source === 'wix' && Date.now() - lastSyncMs < 30_000) {
-					console.log('[webhook] skip: db timestamp guard', hsId);
-					continue;
-				}
+				if (idMap.last_sync_source === 'wix' && Date.now() - lastSyncMs < 30_000) { console.log('[webhook] skip: db timestamp guard', hsId); continue; }
 
-				const wixContact = await wixGetContact(env, instanceId, siteId, idMap.wix_id);
-				const info = await buildWixInfo(env, instanceId, siteId, hsProps, mappings);
+				const wixContact = await wixGetContact(env, siteId, idMap.wix_id);
+				const info = await buildWixInfo(env, siteId, hsProps, mappings);
 				console.log('[webhook] built wix info', JSON.stringify({ keys: Object.keys(info) }));
 
-				if (Object.keys(info).length) {
-					await wixUpdateContact(env, instanceId, siteId, idMap.wix_id, wixContact.revision, info);
-					console.log('[webhook] wix contact updated', idMap.wix_id);
-				} else {
-					console.log('[webhook] skip: no mapped fields to write', hsId);
-				}
+				if (Object.keys(info).length) { await wixUpdateContact(env, siteId, idMap.wix_id, wixContact.revision, info); console.log('[webhook] wix contact updated', idMap.wix_id); }
+				else { console.log('[webhook] skip: no mapped fields to write', hsId); }
 
-				await sb.from('contact_id_map').upsert(
-					{ instance_id: instanceId, wix_id: idMap.wix_id, hubspot_id: hsId, entity_type: 'contact', last_sync_source: 'hubspot', last_sync_id: syncId, last_synced_at: new Date().toISOString() },
-					{ onConflict: 'instance_id,wix_id,entity_type' },
-				);
+				await sb.from('contact_id_map').upsert({ instance_id: instanceId, wix_id: idMap.wix_id, hubspot_id: hsId, entity_type: 'contact', last_sync_source: 'hubspot', last_sync_id: syncId, last_synced_at: new Date().toISOString() }, { onConflict: 'instance_id,wix_id,entity_type' });
 				await sb.from('sync_log').insert({ instance_id: instanceId, direction: 'hubspot_to_wix', entity_type: 'contact', wix_id: idMap.wix_id, hubspot_id: hsId, status: 'success', sync_id: syncId, synced_at: new Date().toISOString() });
 			} else {
 				const existingWixId = hsProps.wix_contact_id;
-
 				if (existingWixId) {
-					// Guard: two cases to skip:
-					//   (a) no row for this wix_id → user manually deleted the sync link
-					//   (b) row exists but points to a DIFFERENT hs_id → this contact is a
-					//       stale duplicate; the Wix ID is already owned by another HS contact.
-					//       Skipping prevents a stale webhook from overwriting the live mapping.
-					const { data: reverseRows } = await sb
-						.from('contact_id_map')
-						.select('wix_id, hubspot_id')
-						.eq('instance_id', instanceId)
-						.eq('wix_id', existingWixId)
-						.eq('entity_type', 'contact')
-						.limit(1);
-					if (!reverseRows?.length) {
-						console.log('[webhook] skip: sync link was manually removed', JSON.stringify({ existingWixId, hsId }));
-						await sb.from('sync_log').insert({ instance_id: instanceId, direction: 'hubspot_to_wix', entity_type: 'contact', wix_id: existingWixId, hubspot_id: hsId, status: 'skipped', sync_id: syncId, synced_at: new Date().toISOString() });
-						continue;
-					}
-					if (reverseRows[0].hubspot_id !== hsId) {
-						console.log('[webhook] skip: wix_contact_id claimed by another HS contact', JSON.stringify({ existingWixId, hsId, claimedBy: reverseRows[0].hubspot_id }));
-						await sb.from('sync_log').insert({ instance_id: instanceId, direction: 'hubspot_to_wix', entity_type: 'contact', wix_id: existingWixId, hubspot_id: hsId, status: 'skipped', sync_id: syncId, synced_at: new Date().toISOString() });
-						continue;
-					}
-
 					console.log('[webhook] HubSpot contact has wix_contact_id, updating original Wix contact', JSON.stringify({ existingWixId, hsId }));
-					const wixContact = await wixGetContact(env, instanceId, siteId, existingWixId);
-					const info = await buildWixInfo(env, instanceId, siteId, hsProps, mappings);
-					if (Object.keys(info).length) {
-						await wixUpdateContact(env, instanceId, siteId, existingWixId, wixContact.revision, info);
-					}
-					await sb.from('contact_id_map').upsert(
-						{ instance_id: instanceId, wix_id: existingWixId, hubspot_id: hsId, entity_type: 'contact', last_sync_source: 'hubspot', last_sync_id: syncId, last_synced_at: new Date().toISOString() },
-						{ onConflict: 'instance_id,wix_id,entity_type' },
-					);
+					const wixContact = await wixGetContact(env, siteId, existingWixId);
+					const info = await buildWixInfo(env, siteId, hsProps, mappings);
+					if (Object.keys(info).length) { await wixUpdateContact(env, siteId, existingWixId, wixContact.revision, info); }
+					await sb.from('contact_id_map').upsert({ instance_id: instanceId, wix_id: existingWixId, hubspot_id: hsId, entity_type: 'contact', last_sync_source: 'hubspot', last_sync_id: syncId, last_synced_at: new Date().toISOString() }, { onConflict: 'instance_id,wix_id,entity_type' });
 					await sb.from('sync_log').insert({ instance_id: instanceId, direction: 'hubspot_to_wix', entity_type: 'contact', wix_id: existingWixId, hubspot_id: hsId, status: 'success', sync_id: syncId, synced_at: new Date().toISOString() });
 				} else if (hsProps.wix_sync_source?.startsWith('wix_sync_')) {
 					console.log('[webhook] skip: Wix-origin contact without wix_contact_id', hsId);
 				} else {
-					const info = await buildWixInfo(env, instanceId, siteId, hsProps, mappings);
+					const info = await buildWixInfo(env, siteId, hsProps, mappings);
 					console.log('[webhook] no idMap — create path, info keys:', JSON.stringify(Object.keys(info)));
-					if (!Object.keys(info).length) {
-						console.log('[webhook] skip: no mapped fields for new contact', hsId);
-						continue;
-					}
-					const newWixId = await wixCreateContact(env, instanceId, siteId, info);
+					if (!Object.keys(info).length) { console.log('[webhook] skip: no mapped fields for new contact', hsId); continue; }
+					const newWixId = await wixCreateContact(env, siteId, info);
 					console.log('[webhook] wix contact created', newWixId);
 					if (!newWixId) continue;
-					await sb.from('contact_id_map').upsert(
-						{ instance_id: instanceId, wix_id: newWixId, hubspot_id: hsId, entity_type: 'contact', last_sync_source: 'hubspot', last_sync_id: syncId, last_synced_at: new Date().toISOString() },
-						{ onConflict: 'instance_id,wix_id,entity_type' },
-					);
+					await sb.from('contact_id_map').upsert({ instance_id: instanceId, wix_id: newWixId, hubspot_id: hsId, entity_type: 'contact', last_sync_source: 'hubspot', last_sync_id: syncId, last_synced_at: new Date().toISOString() }, { onConflict: 'instance_id,wix_id,entity_type' });
 					await sb.from('sync_log').insert({ instance_id: instanceId, direction: 'hubspot_to_wix', entity_type: 'contact', wix_id: newWixId, hubspot_id: hsId, status: 'success', sync_id: syncId, synced_at: new Date().toISOString() });
 				}
 			}
@@ -450,9 +360,7 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
 			try {
 				const { data: tokenRows } = await sb.from('hubspot_tokens').select('instance_id').eq('portal_id', event.portalId).limit(1);
 				const instanceId = tokenRows?.[0]?.instance_id;
-				if (instanceId) {
-					await sb.from('sync_log').insert({ instance_id: instanceId, direction: 'hubspot_to_wix', entity_type: 'contact', wix_id: null, hubspot_id: hsId, status: 'error', error_message: String(err), sync_id: null, synced_at: new Date().toISOString() });
-				}
+				if (instanceId) { await sb.from('sync_log').insert({ instance_id: instanceId, direction: 'hubspot_to_wix', entity_type: 'contact', wix_id: null, hubspot_id: hsId, status: 'error', error_message: String(err), sync_id: null, synced_at: new Date().toISOString() }); }
 			} catch { /* suppress */ }
 		}
 	}
@@ -460,12 +368,10 @@ async function handleWebhook(req: Request, env: Env): Promise<Response> {
 	return Response.json({ ok: true });
 }
 
-// ── Entry point ───────────────────────────────────────────────────
-
 export default {
 	async fetch(req: Request, env: Env): Promise<Response> {
 		if (req.method !== 'POST') return new Response('Method not allowed', { status: 405 });
-
 		return handleWebhook(req, env);
 	},
 } satisfies ExportedHandler<Env>;
+```
