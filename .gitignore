@@ -165,3 +165,7 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+# markdown files (except CLAUDE.md)
+*.md
+!CLAUDE.md

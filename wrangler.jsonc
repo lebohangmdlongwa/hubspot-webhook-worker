@@ -7,6 +7,7 @@
 	"name": "hubspot-webhook-worker",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-05-25",
+	"account_id": "2e457a8f3cc2a43e8c7d4edbcb999316",
 	"observability": {
 		"enabled": true
 	},
